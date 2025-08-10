@@ -1,1 +1,202 @@
+<!doctype html>
+<html lang="da">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LUX – Bluetooth styring</title>
 
+  <!-- Aggressiv no-cache så Bluefy ikke bruger gammel version -->
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+
+  <!-- iOS Smart App Banner (Bluefy i App Store) -->
+  <meta name="apple-itunes-app" content="app-id=1492822055">
+
+  <style>
+    body{font:14px system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px;line-height:1.45}
+    h1{font-size:18px;margin:0 0 12px}
+    .card{border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin:12px 0}
+    button{padding:10px 14px;border:1px solid #ccc;border-radius:10px;cursor:pointer;margin:6px 8px 6px 0}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    #status{margin-top:10px;color:#444}
+    .hidden{display:none}
+    .note{color:#666}
+    .ok{color:#0a7f2e}.err{color:#b3261e}.warn{color:#9a6700}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    #log{white-space:pre-wrap;min-height:100px;background:#0b1020;color:#d1e8ff;border-radius:10px;padding:10px}
+  </style>
+</head>
+<body>
+  <h1>LUX – Bluetooth styring</h1>
+
+  <!-- iOS-hjælp: vises kun når Web Bluetooth ikke er tilgængelig på iOS -->
+  <div id="iosBlock" class="card hidden">
+    <strong>iOS</strong>
+    <p>Safari understøtter ikke Web Bluetooth. Brug en iOS-browser med Web Bluetooth (fx <em>Bluefy</em>), og åbn samme side i den.</p>
+    <div>
+      <button id="openBluefy">Åbn i Bluefy</button>
+      <button id="getBluefy">Hent Bluefy i App Store</button>
+      <button id="copyLink">Kopiér link</button>
+    </div>
+    <p class="note">“Åbn i Bluefy” prøver at starte appen med denne adresse. Reagerer appen ikke, åbnes App Store automatisk.</p>
+    <p class="mono" id="pageUrl" style="user-select:all"></p>
+  </div>
+
+  <div class="card">
+    <button id="connect">Forbind</button>
+    <button id="disconnect" disabled>Afbryd</button>
+    <button id="red" disabled>Rød</button>
+    <button id="green" disabled>Grøn</button>
+    <div id="status" class="note">Ikke tilsluttet</div>
+    <div id="active" class="note hidden">Aktiv: service <span id="svc" class="mono">–</span> · char <span id="chr" class="mono">–</span></div>
+  </div>
+
+  <div id="logBlock" class="card hidden">
+    <strong>Log</strong>
+    <div id="log" class="mono"></div>
+  </div>
+
+  <script type="module">
+    // === Dynamisk import med version (cache-bust) ===
+    const VERSION = '2025-08-09'; // opdatér ved næste deploy
+    const { LuxTransport, envProbe } = await import('./lux-ble.js?v=' + encodeURIComponent(VERSION));
+
+    const $ = s=>document.querySelector(s);
+    const logEl = $('#log'), logBlock = $('#logBlock');
+    function log(m, cls){ logBlock.classList.remove('hidden'); const ts=new Date().toLocaleTimeString(); const d=document.createElement('div'); if(cls) d.className=cls; d.textContent=`[${ts}] ${m}`; logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight; }
+    function setStatus(txt, cls){ const el=$('#status'); el.textContent=txt; el.className=cls?cls:'note'; }
+
+    // ——— iOS-detektion og Bluefy-flow ———
+    const ua = navigator.userAgent;
+    const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints>1);
+    const secure = location.protocol==='https:' || location.hostname==='localhost' || location.hostname==='127.0.0.1';
+    const hasWB = !!navigator.bluetooth;
+
+    // Pæn URL i boksen: brug /ble/ i stedet for /ble/default.html
+    const cleanUrl = (() => {
+      const u = new URL(location.href);
+      if (u.pathname.toLowerCase().endsWith('/default.html')) {
+        u.pathname = u.pathname.replace(/default\.html$/i, '');
+      }
+      // Tilføj versions-query for at tvinge frisk indlæsning i Bluefy
+      u.searchParams.set('v', VERSION);
+      return u.href;
+    })();
+    $('#pageUrl').textContent = cleanUrl;
+
+    // “Åbn i Bluefy”: prøv flere schemes med URL-parameter + fallback til App Store
+    function openInBluefyWithUrl(url) {
+      const BLUEFY_APPSTORE = 'itms-apps://apps.apple.com/app/id1492822055';
+      const candidates = [
+        // hvis Bluefy understøtter “open?url=…”
+        'bluefy://open?url=',
+        // generisk query
+        'bluefy://?url=',
+        // x-callback-url stil
+        'bluefy://x-callback-url/open?url=',
+        // sidste udvej: bare åbn appen
+        'bluefy://'
+      ];
+      let hidden = false, i = 0;
+
+      const tryNext = () => {
+        if (i >= candidates.length) {
+          // ingen reagerede -> App Store
+          window.location.href = BLUEFY_APPSTORE;
+          return;
+        }
+        const scheme = candidates[i++] + (candidates[i-1].endsWith('://') ? '' : encodeURIComponent(url));
+        // forsøg åbning
+        try { window.location.href = scheme; } catch {}
+        // hvis app ikke overtager fokus hurtigt, prøv næste
+        setTimeout(()=>{ if (!hidden) tryNext(); }, 600);
+      };
+
+      document.addEventListener('visibilitychange', () => { if (document.hidden) hidden = true; }, { once: true });
+      tryNext();
+    }
+
+    if (isIOS && !(secure && hasWB)) {
+      $('#iosBlock').classList.remove('hidden');
+      $('#openBluefy').addEventListener('click', ()=>openInBluefyWithUrl(cleanUrl));
+      $('#getBluefy').addEventListener('click', ()=>{ window.location.href = 'itms-apps://apps.apple.com/app/id1492822055'; });
+      $('#copyLink').addEventListener('click', async ()=>{
+        try { await navigator.clipboard.writeText(cleanUrl); alert('Link kopieret. Åbn Bluefy og indsæt i adresselinjen.'); }
+        catch { prompt('Kopiér link:', cleanUrl); }
+      });
+    }
+
+    // ——— BLE transport ———
+    const t = new LuxTransport({ url: null }); // ren Web Bluetooth; ingen gateway
+    let currentMeta = null;
+
+    function setConnectedUI(c){
+      $('#disconnect').disabled = !c;
+      $('#red').disabled = !c;
+      $('#green').disabled = !c;
+      $('#connect').disabled = c;
+      if (!c) {
+        $('#active').classList.add('hidden');
+        $('#svc').textContent='–'; $('#chr').textContent='–';
+      }
+    }
+
+    async function disconnectAllAllowedLux(){
+      try{
+        const devs = await navigator.bluetooth.getDevices();
+        for (const d of devs) {
+          if (d.name && d.name.startsWith('LUX') && d.gatt?.connected) {
+            try { d.gatt.disconnect(); log(`Frigav tidligere enhed: ${d.name}`, 'warn'); } catch {}
+          }
+        }
+      }catch{}
+    }
+
+    // ——— UI handlers ———
+    $('#connect').addEventListener('click', async ()=>{
+      try{
+        setStatus('Forbinder…'); log('Forbinder…');
+        await disconnectAllAllowedLux();
+
+        const info = await t.connect((meta)=>{
+          currentMeta = meta || null;
+          if (meta?.svc && meta?.chr){
+            $('#svc').textContent = meta.svc;
+            $('#chr').textContent = meta.chr;
+            $('#active').classList.remove('hidden');
+          }
+        });
+        setStatus(`Tilsluttet via ${info.transport}`, 'ok');
+        setConnectedUI(true);
+        log(`Transport: ${info.transport}`, 'ok');
+      }catch(e){
+        setStatus('Ikke tilsluttet: '+e.message, 'err'); log('Fejl: '+e.message, 'err');
+        setConnectedUI(false);
+      }
+    });
+
+    $('#disconnect').addEventListener('click', async ()=>{
+      try{
+        log('Afbryder…');
+        await t.disconnect();
+        await new Promise(r=>setTimeout(r,300)); // lad OS slippe linket
+        await disconnectAllAllowedLux();
+        setConnectedUI(false);
+        setStatus('Afbundet – klar til ny forbindelse', 'warn');
+        log('Afbundet.', 'warn');
+      }catch(e){
+        setStatus('Fejl ved afbrydelse: '+e.message,'err'); log('Afbryd-fejl: '+e.message,'err');
+      }
+    });
+
+    $('#red').addEventListener('click', ()=> t.sendColor(255,0,0).catch(e=>{ setStatus('Fejl: '+e.message,'err'); log('TX-fejl: '+e.message,'err'); }));
+    $('#green').addEventListener('click', ()=> t.sendColor(0,255,0).catch(e=>{ setStatus('Fejl: '+e.message,'err'); log('TX-fejl: '+e.message,'err'); }));
+
+    // ——— Miljølog ———
+    const env = envProbe();
+    log(`Secure context: ${env.https || env.localhost}`, (env.https||env.localhost)?'ok':'warn');
+    log(`Web Bluetooth tilgængelig: ${env.webBluetooth}`, env.webBluetooth?'ok':'warn');
+  </script>
+</body>
+</html>
